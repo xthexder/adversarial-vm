@@ -83,8 +83,8 @@ func WriteProgram(x, y uint32) {
 		WriteInstruction(x, y, &r, ADDI, -1)
 		WriteInstruction(x, y, &r, COND, int32(loop-r))
 	}
-	{ // for i := 1024; i != 0; i-- {
-		WriteInstruction(x, y, &r, SETA, 1024)
+	{ // for i := 2048; i != 0; i-- {
+		WriteInstruction(x, y, &r, SETA, 2048)
 		loop := r
 		{ // Push random green to stack
 			WriteInstruction(x, y, &r, SWAP, 0)
@@ -96,8 +96,8 @@ func WriteProgram(x, y uint32) {
 		WriteInstruction(x, y, &r, ADDI, -1)
 		WriteInstruction(x, y, &r, COND, int32(loop-r))
 	}
-	{ // for i := 1024; i != 0; i-- {
-		WriteInstruction(x, y, &r, SETA, 1024)
+	{ // for i := 4096; i != 0; i-- {
+		WriteInstruction(x, y, &r, SETA, 4096)
 		loop := r
 		{ // Push random red to stack
 			WriteInstruction(x, y, &r, SWAP, 0)
@@ -188,7 +188,7 @@ func main() {
 		log.Printf("Error while setting window surface to image %d: %s\n", DisplayWindow, err)
 	}
 
-	// Start a program in the center of the screen if no programs are running
+	// Start a program in the center of the screen if there have been no recent forks
 	go func() {
 		for {
 			count := atomic.SwapInt64(&forkCount, 0)
@@ -215,13 +215,16 @@ var printTimer <-chan time.Time
 var execs [1024][1024]uint32
 
 func Exec(x, y uint32) {
-	if int(x) >= WindowImage.Rect.Max.X || int(y) >= WindowImage.Rect.Max.Y {
-		return
-	}
+	// Limit executions to 100 concurrent programs
 	count := atomic.AddInt64(&execCount, 1)
 	atomic.AddInt64(&forkCount, 1)
 	defer atomic.AddInt64(&execCount, -1)
 	if count > 100 {
+		return
+	}
+
+	// De-duplicate programs running at the same location
+	if int(x) >= WindowImage.Rect.Max.X || int(y) >= WindowImage.Rect.Max.Y {
 		return
 	}
 	old := atomic.SwapUint32(&execs[x][y], 1)
@@ -229,6 +232,7 @@ func Exec(x, y uint32) {
 		return
 	}
 	defer atomic.StoreUint32(&execs[x][y], 0)
+
 	// fmt.Println("Starting program at", x, y)
 	for {
 		// Read Program Counter
