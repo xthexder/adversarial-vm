@@ -16,7 +16,7 @@ import (
 )
 
 var DisplayWindow *xwindow.Window
-var WindowImage *xgraphics.Image
+var DisplayImage *xgraphics.Image
 var X *xgbutil.XUtil
 
 type Instruction uint32
@@ -122,10 +122,13 @@ func WriteProgram(x, y uint32) {
 		}
 		{ // Select random coordinates for new program and set stack pointer to end of remote program
 			WriteInstruction(x, y, &r, SWAP, 0)
+			WriteInstruction(x, y, &r, LOCAL, 0)
+			WriteInstruction(x, y, &r, PUSH, 0)
 			WriteInstruction(x, y, &r, SETA, 0)
-			WriteInstruction(x, y, &r, RAND, 1024)
+			WriteInstruction(x, y, &r, RAND, -128)
 			WriteInstruction(x, y, &r, SHIFT, 12)
-			WriteInstruction(x, y, &r, RAND, 1024)
+			WriteInstruction(x, y, &r, RAND, -128)
+			WriteInstruction(x, y, &r, ADDS, 0)
 			WriteInstruction(x, y, &r, SWAP, 0)
 			WriteInstruction(x, y, &r, ADDI, -1)
 			WriteInstruction(x, y, &r, RSET, int32(STACK_POINTER))
@@ -158,9 +161,9 @@ func WriteProgram(x, y uint32) {
 	}
 	WriteInstruction(x, y, &r, JUMP, int32(start-r))
 
-	data, _ := Coords(x, y, PROGRAM_COUNTER)
+	data, _ := Coords(time.Now(), x, y, PROGRAM_COUNTER)
 	Write24Bit(data, 0) // Initial program counter
-	data, _ = Coords(x, y, STACK_POINTER)
+	data, _ = Coords(time.Now(), x, y, STACK_POINTER)
 	Write24Bit(data, r) // Set stack pointer to end of program
 
 	// fmt.Println("Program length:", r)
@@ -181,9 +184,8 @@ func main() {
 	DisplayWindow.Create(X.RootWin(), 0, 0, 1024, 1024, xproto.CwBackPixel, 0)
 	DisplayWindow.Map()
 
-	WindowImage = xgraphics.New(X, image.Rect(0, 0, 1024, 1024))
-
-	err = WindowImage.XSurfaceSet(DisplayWindow.Id)
+	DisplayImage = xgraphics.New(X, image.Rect(0, 0, len(imageData), len(imageData[0])))
+	err = DisplayImage.XSurfaceSet(DisplayWindow.Id)
 	if err != nil {
 		log.Printf("Error while setting window surface to image %d: %s\n", DisplayWindow, err)
 	}
@@ -201,8 +203,8 @@ func main() {
 		}
 	}()
 
-	drawTimer = time.Tick(16 * time.Millisecond)
-	printTimer = time.Tick(1 * time.Second)
+	drawTimer = time.After(16 * time.Millisecond)
+	printTimer = time.After(1 * time.Second)
 
 	xevent.Main(X)
 }
@@ -213,18 +215,12 @@ var fpsCount int64 = 0
 var drawTimer <-chan time.Time
 var printTimer <-chan time.Time
 var execs [1024][1024]uint32
+var imageData [1024][1024][3]uint8
+var lastAccessTime [1024][1024]time.Time
 
 func Exec(x, y uint32) {
-	// Limit executions to 100 concurrent programs
-	count := atomic.AddInt64(&execCount, 1)
-	atomic.AddInt64(&forkCount, 1)
-	defer atomic.AddInt64(&execCount, -1)
-	if count > 100 {
-		return
-	}
-
 	// De-duplicate programs running at the same location
-	if int(x) >= WindowImage.Rect.Max.X || int(y) >= WindowImage.Rect.Max.Y {
+	if int(x) >= len(imageData) || int(y) >= len(imageData[0]) {
 		return
 	}
 	old := atomic.SwapUint32(&execs[x][y], 1)
@@ -233,10 +229,21 @@ func Exec(x, y uint32) {
 	}
 	defer atomic.StoreUint32(&execs[x][y], 0)
 
+	atomic.AddInt64(&forkCount, 1)
+
+	// Limit executions to 100 concurrent programs
+	count := atomic.AddInt64(&execCount, 1)
+	defer atomic.AddInt64(&execCount, -1)
+	if count > 100 {
+		return
+	}
+
+	createdTime := time.Now()
+
 	// fmt.Println("Starting program at", x, y)
 	for {
 		// Read Program Counter
-		mem, ok := Coords(x, y, PROGRAM_COUNTER)
+		mem, ok := Coords(createdTime, x, y, PROGRAM_COUNTER)
 		if !ok {
 			// fmt.Println("Program", x, y, "invalid")
 			return
@@ -244,7 +251,7 @@ func Exec(x, y uint32) {
 		PC := Read24Bit(mem)
 
 		// Read Stack Pointer
-		mem, ok = Coords(x, y, STACK_POINTER)
+		mem, ok = Coords(createdTime, x, y, STACK_POINTER)
 		if !ok {
 			// fmt.Println("Program", x, y, "has invalid stack pointer")
 			return
@@ -252,7 +259,7 @@ func Exec(x, y uint32) {
 		S := Read24Bit(mem)
 
 		// Read Register A
-		mem, ok = Coords(x, y, REGISTER_A)
+		mem, ok = Coords(createdTime, x, y, REGISTER_A)
 		if !ok {
 			// fmt.Println("Program", x, y, "has invalid register A")
 			return
@@ -260,7 +267,7 @@ func Exec(x, y uint32) {
 		A := Read24Bit(mem)
 
 		// Read Register B
-		mem, ok = Coords(x, y, REGISTER_B)
+		mem, ok = Coords(createdTime, x, y, REGISTER_B)
 		if !ok {
 			// fmt.Println("Program", x, y, "has invalid register B")
 			return
@@ -268,7 +275,7 @@ func Exec(x, y uint32) {
 		B := Read24Bit(mem)
 
 		// Read instruction
-		mem, ok = Coords(x, y, PROGRAM+PC)
+		mem, ok = Coords(createdTime, x, y, PROGRAM+PC)
 		if !ok {
 			// fmt.Println("Program", x, y, "has invalid PC:", PC)
 			return
@@ -288,99 +295,106 @@ func Exec(x, y uint32) {
 				PC += Signed20Bit(data) - 1
 			}
 		case SETA: // Set register A
-			mem, _ = Coords(x, y, REGISTER_A)
+			mem, _ = Coords(createdTime, x, y, REGISTER_A)
 			Write24Bit(mem, data)
 		case ADDI: // Add immediate to A
-			mem, _ = Coords(x, y, REGISTER_A)
+			mem, _ = Coords(createdTime, x, y, REGISTER_A)
 			Write24Bit(mem, A+Signed20Bit(data))
 		case PUSH: // Push A to stack
-			mem, ok = Coords(x, y, S)
+			mem, ok = Coords(createdTime, x, y, S)
 			if !ok {
 				// fmt.Println("Program", x, y, "has stack overflow:", S)
 				return
 			}
 			Write24Bit(mem, A)
-			mem, _ = Coords(x, y, STACK_POINTER)
+			mem, _ = Coords(createdTime, x, y, STACK_POINTER)
 			Write24Bit(mem, S+1)
 		case POP: // Pop stack into A
-			mem, ok = Coords(x, y, S-1)
+			mem, ok = Coords(createdTime, x, y, S-1)
 			if !ok {
 				// fmt.Println("Program", x, y, "has stack overflow:", S-1)
 				return
 			}
 			r := Read24Bit(mem)
-			mem, _ = Coords(x, y, STACK_POINTER)
+			mem, _ = Coords(createdTime, x, y, STACK_POINTER)
 			Write24Bit(mem, S-1)
-			mem, _ = Coords(x, y, REGISTER_A)
+			mem, _ = Coords(createdTime, x, y, REGISTER_A)
 			Write24Bit(mem, r)
 		case ADDS: // Pop from stack and add to A
-			mem, ok = Coords(x, y, S-1)
+			mem, ok = Coords(createdTime, x, y, S-1)
 			if !ok {
 				// fmt.Println("Program", x, y, "has stack overflow:", S-1)
 				return
 			}
 			r := Read24Bit(mem)
-			mem, _ = Coords(x, y, STACK_POINTER)
+			mem, _ = Coords(createdTime, x, y, STACK_POINTER)
 			Write24Bit(mem, S-1)
-			mem, _ = Coords(x, y, REGISTER_A)
+			mem, _ = Coords(createdTime, x, y, REGISTER_A)
 			Write24Bit(mem, A+r)
 		case SWAP: // Swap registers A and B
-			mem, _ = Coords(x, y, REGISTER_B)
+			mem, _ = Coords(createdTime, x, y, REGISTER_B)
 			Write24Bit(mem, A)
-			mem, _ = Coords(x, y, REGISTER_A)
+			mem, _ = Coords(createdTime, x, y, REGISTER_A)
 			Write24Bit(mem, B)
 		case RAND: // Add random bits to A
-			mem, _ = Coords(x, y, REGISTER_A)
+			mem, _ = Coords(createdTime, x, y, REGISTER_A)
 			r := rand.Uint32()
-			if data != 0 {
-				r = r % data
+			signedData := Signed20Bit(data)
+			if int32(signedData) > 0 {
+				r = r % signedData
+			} else if int32(signedData) < 0 {
+				if (r & 0x80000000) != 0 {
+					r = -(r % -signedData)
+				} else {
+					r = r % -signedData
+				}
 			}
 			Write24Bit(mem, A+r)
 		case SHIFT: // Shift A by data (signed)
-			mem, _ = Coords(x, y, REGISTER_A)
+			mem, _ = Coords(createdTime, x, y, REGISTER_A)
 			Write24Bit(mem, A<<Signed20Bit(data))
 		case LOCAL: // Set A to x,y
-			mem, _ = Coords(x, y, REGISTER_A)
+			mem, _ = Coords(createdTime, x, y, REGISTER_A)
 			Write12Bit(mem, x, y)
 		case RPUSH: // Push to remote stack
-			mem, _ = Coords(x, y, REGISTER_B)
+			mem, _ = Coords(createdTime, x, y, REGISTER_B)
 			x2, y2 := Read12Bit(mem)
-			mem, ok = Coords(x2, y2, STACK_POINTER)
+			mem, ok = Coords(createdTime, x2, y2, STACK_POINTER)
 			if !ok {
 				// fmt.Println("Program", x2, y2, "has invalid stack pointer")
 			} else {
 				S2 := Read24Bit(mem)
-				mem, ok = Coords(x2, y2, S2)
+				mem, ok = Coords(createdTime, x2, y2, S2)
 				if !ok {
 					// fmt.Println("Program", x2, y2, "has remote stack overflow:", S2)
 				} else {
 					Write24Bit(mem, A)
 				}
-				mem, _ = Coords(x2, y2, STACK_POINTER)
+				mem, _ = Coords(createdTime, x2, y2, STACK_POINTER)
 				Write24Bit(mem, S2+1)
 			}
 		case RSET: // Write A into remote address
-			mem, _ = Coords(x, y, REGISTER_B)
+			mem, _ = Coords(createdTime, x, y, REGISTER_B)
 			x2, y2 := Read12Bit(mem)
-			mem, ok = Coords(x2, y2, data)
+			mem, ok = Coords(createdTime, x2, y2, data)
 			if !ok {
 				// fmt.Println("Program", x, y, "has invalid remote write:", x2, y2, data)
 			} else {
 				Write24Bit(mem, A)
 			}
 		case RGET: // Read remote address into A
-			mem, _ = Coords(x, y, REGISTER_B)
+			mem, _ = Coords(createdTime, x, y, REGISTER_B)
 			x2, y2 := Read12Bit(mem)
-			mem, ok = Coords(x2, y2, data)
+			mem, ok = Coords(createdTime, x2, y2, data)
 			if !ok {
 				// fmt.Println("Program", x, y, "has invalid remote read:", x2, y2, data)
 			} else {
 				r := Read24Bit(mem)
-				mem, _ = Coords(x, y, REGISTER_A)
+				mem, _ = Coords(createdTime, x, y, REGISTER_A)
 				Write24Bit(mem, r)
 			}
 		case FORK: // Call go Exec(B)
-			mem, _ = Coords(x, y, REGISTER_B)
+			mem, _ = Coords(createdTime, x, y, REGISTER_B)
 			x2, y2 := Read12Bit(mem)
 			go Exec(x2, y2)
 		default:
@@ -389,17 +403,19 @@ func Exec(x, y uint32) {
 		}
 
 		// Advance program counter
-		mem, _ = Coords(x, y, PROGRAM_COUNTER)
+		mem, _ = Coords(createdTime, x, y, PROGRAM_COUNTER)
 		Write24Bit(mem, PC+1)
 
 		select {
 		case <-drawTimer:
 			atomic.AddInt64(&fpsCount, 1)
-			DrawImage(WindowImage)
+			DrawImage()
+			drawTimer = time.After(16 * time.Millisecond)
 		case <-printTimer:
 			execs := atomic.LoadInt64(&execCount)
 			fps := atomic.SwapInt64(&fpsCount, 0)
 			fmt.Println("FPS:", fps, "Current executions:", execs)
+			printTimer = time.After(1 * time.Second)
 		default:
 			time.Sleep(100 * time.Nanosecond)
 		}
@@ -408,7 +424,7 @@ func Exec(x, y uint32) {
 
 // Write an instruction to x,y,r
 func WriteInstruction(x, y uint32, r *uint32, instr Instruction, data int32) {
-	mem, _ := Coords(x, y, *r)
+	mem, _ := Coords(time.Now(), x, y, *r)
 	instrData := (uint32(instr&0xF) << 20) | uint32(data&0xFFFFF)
 	Write24Bit(mem, instrData)
 	*r++
@@ -457,18 +473,18 @@ func Signed20Bit(in uint32) (out uint32) {
 var CoordOffset []XY
 
 // Return the slice of pixel data for the psuedo-polar coordinates x,y,r
-func Coords(x, y, r uint32) ([]uint8, bool) {
+func Coords(accessTime time.Time, x, y, r uint32) ([]uint8, bool) {
 	if r >= uint32(len(CoordOffset)) {
 		// log.Printf("Coord radius too large: %d\n", r)
 		return []uint8{0, 0, 0}, false
 	}
 	dx := CoordOffset[r][0]
 	dy := CoordOffset[r][1]
-	if int(x)+dx < 0 || int(x)+dx >= WindowImage.Rect.Max.X || int(y)+dy < 0 || int(y)+dy >= WindowImage.Rect.Max.Y {
+	if int(x)+dx < 0 || int(x)+dx >= len(imageData) || int(y)+dy < 0 || int(y)+dy >= len(imageData[0]) {
 		return []uint8{0, 0, 0}, false
 	}
-	i := (int(x)+dx)*4 + (int(y)+dy)*WindowImage.Stride
-	return WindowImage.Pix[i : i+3], true
+	lastAccessTime[int(x)+dx][int(y)+dy] = accessTime.Add(time.Since(accessTime) / 2) //time.Now()
+	return imageData[int(x)+dx][int(y)+dy][:], true
 }
 
 var DirOffset = [8]XY{
@@ -532,7 +548,22 @@ func init() {
 	}
 }
 
-func DrawImage(img *xgraphics.Image) {
-	img.XDraw()
-	img.XPaint(DisplayWindow.Id)
+func DrawImage() {
+	for x := 0; x < 1024; x++ {
+		for y := 0; y < 1024; y++ {
+			i := x*4 + y*DisplayImage.Stride
+			div := int(1000 * time.Since(lastAccessTime[x][y]) / time.Second)
+			if div > 1000 {
+				DisplayImage.Pix[i] = uint8(int(imageData[x][y][0]) * 1000 / div)
+				DisplayImage.Pix[i+1] = uint8(int(imageData[x][y][1]) * 1000 / div)
+				DisplayImage.Pix[i+2] = uint8(int(imageData[x][y][2]) * 1000 / div)
+			} else {
+				DisplayImage.Pix[i] = imageData[x][y][0]
+				DisplayImage.Pix[i+1] = imageData[x][y][1]
+				DisplayImage.Pix[i+2] = imageData[x][y][2]
+			}
+		}
+	}
+	DisplayImage.XDraw()
+	DisplayImage.XPaint(DisplayWindow.Id)
 }
