@@ -392,6 +392,10 @@ func Exec(x, y uint32) {
 		mem, _ = Coords(x, y, PROGRAM_COUNTER)
 		Write24Bit(mem, PC+1)
 
+		if (atomic.AddUint32(&execs[x][y], 1) > 1000000) {
+			return
+		}
+
 		select {
 		case <-drawTimer:
 			atomic.AddInt64(&fpsCount, 1)
